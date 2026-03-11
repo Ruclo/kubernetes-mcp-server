@@ -738,6 +738,186 @@ func (s *KubevirtSuite) TestVMClone() {
 
 }
 
+func (s *KubevirtSuite) TestVMHotplug() {
+	dynamicClient := dynamic.NewForConfigOrDie(envTestRestConfig)
+	vm := &unstructured.Unstructured{}
+	vm.SetUnstructuredContent(map[string]interface{}{
+		"apiVersion": "kubevirt.io/v1",
+		"kind":       "VirtualMachine",
+		"metadata": map[string]interface{}{
+			"name":      "test-vm-hotplug",
+			"namespace": "default",
+		},
+		"spec": map[string]interface{}{
+			"runStrategy": "Always",
+			"template": map[string]interface{}{
+				"spec": map[string]interface{}{
+					"domain": map[string]interface{}{
+						"devices": map[string]interface{}{
+							"disks": []interface{}{
+								map[string]interface{}{"name": "rootdisk", "disk": map[string]interface{}{"bus": "virtio"}},
+							},
+						},
+					},
+					"volumes": []interface{}{
+						map[string]interface{}{"name": "rootdisk", "containerDisk": map[string]interface{}{"image": "fedora:latest"}},
+					},
+				},
+			},
+		},
+	})
+	_, err := dynamicClient.Resource(schema.GroupVersionResource{
+		Group: "kubevirt.io", Version: "v1", Resource: "virtualmachines",
+	}).Namespace("default").Create(s.T().Context(), vm, metav1.CreateOptions{})
+	s.Require().NoError(err, "failed to create test VM")
+
+	s.Run("vm_hotplug_pvc missing required params", func() {
+		for _, param := range []string{"namespace", "name", "diskName", "claimName"} {
+			s.Run("missing "+param, func() {
+				params := map[string]interface{}{
+					"namespace": "default",
+					"name":      "test-vm-hotplug",
+					"diskName":  "hp-pvc",
+					"claimName": "my-pvc",
+				}
+				delete(params, param)
+				toolResult, err := s.CallTool("vm_hotplug_pvc", params)
+				s.Require().Nilf(err, "call tool failed %v", err)
+				s.Truef(toolResult.IsError, "expected call tool to fail due to missing %s", param)
+				s.Equal(param+" parameter required", toolResult.Content[0].(*mcp.TextContent).Text)
+			})
+		}
+	})
+
+	s.Run("vm_hotplug_pvc adds PVC with hotpluggable true", func() {
+		toolResult, err := s.CallTool("vm_hotplug_pvc", map[string]interface{}{
+			"namespace": "default",
+			"name":      "test-vm-hotplug",
+			"diskName":  "hp-pvc",
+			"claimName": "my-pvc",
+		})
+		s.Run("no error", func() {
+			s.Nilf(err, "call tool failed %v", err)
+			s.Falsef(toolResult.IsError, "call tool failed: %v", toolResult.Content)
+		})
+		var decodedResult []unstructured.Unstructured
+		err = yaml.Unmarshal([]byte(toolResult.Content[0].(*mcp.TextContent).Text), &decodedResult)
+		s.Run("returns yaml with hotplugged PVC", func() {
+			s.Nilf(err, "invalid tool result content %v", err)
+			s.Truef(strings.HasPrefix(toolResult.Content[0].(*mcp.TextContent).Text, "# PVC hotplugged successfully"),
+				"Expected success message, got %v", toolResult.Content[0].(*mcp.TextContent).Text)
+			s.Require().Lenf(decodedResult, 1, "invalid resource count")
+			vm := &decodedResult[0]
+			s.Equal("my-pvc", test.FieldString(vm, "spec.template.spec.volumes[1].persistentVolumeClaim.claimName"))
+			s.Equal(true, test.FieldValue(vm, "spec.template.spec.volumes[1].persistentVolumeClaim.hotpluggable"))
+			s.Equal("hp-pvc", test.FieldString(vm, "spec.template.spec.domain.devices.disks[1].name"))
+			s.Equal("virtio", test.FieldString(vm, "spec.template.spec.domain.devices.disks[1].disk.bus"))
+		})
+	})
+
+	s.Run("vm_hotplug_datavolume missing required params", func() {
+		for _, param := range []string{"namespace", "name", "diskName", "dataVolumeName"} {
+			s.Run("missing "+param, func() {
+				params := map[string]interface{}{
+					"namespace":      "default",
+					"name":           "test-vm-hotplug",
+					"diskName":       "hp-dv",
+					"dataVolumeName": "my-dv",
+				}
+				delete(params, param)
+				toolResult, err := s.CallTool("vm_hotplug_datavolume", params)
+				s.Require().Nilf(err, "call tool failed %v", err)
+				s.Truef(toolResult.IsError, "expected call tool to fail due to missing %s", param)
+				s.Equal(param+" parameter required", toolResult.Content[0].(*mcp.TextContent).Text)
+			})
+		}
+	})
+
+	s.Run("vm_hotplug_datavolume adds DataVolume with hotpluggable true and scsi bus", func() {
+		toolResult, err := s.CallTool("vm_hotplug_datavolume", map[string]interface{}{
+			"namespace":      "default",
+			"name":           "test-vm-hotplug",
+			"diskName":       "hp-dv",
+			"dataVolumeName": "my-dv",
+			"bus":            "scsi",
+		})
+		s.Run("no error", func() {
+			s.Nilf(err, "call tool failed %v", err)
+			s.Falsef(toolResult.IsError, "call tool failed: %v", toolResult.Content)
+		})
+		var decodedResult []unstructured.Unstructured
+		err = yaml.Unmarshal([]byte(toolResult.Content[0].(*mcp.TextContent).Text), &decodedResult)
+		s.Run("returns yaml with hotplugged DataVolume", func() {
+			s.Nilf(err, "invalid tool result content %v", err)
+			s.Truef(strings.HasPrefix(toolResult.Content[0].(*mcp.TextContent).Text, "# DataVolume hotplugged successfully"),
+				"Expected success message, got %v", toolResult.Content[0].(*mcp.TextContent).Text)
+			s.Require().Lenf(decodedResult, 1, "invalid resource count")
+			vm := &decodedResult[0]
+			s.Equal("my-dv", test.FieldString(vm, "spec.template.spec.volumes[2].dataVolume.name"))
+			s.Equal(true, test.FieldValue(vm, "spec.template.spec.volumes[2].dataVolume.hotpluggable"))
+			s.Equal("hp-dv", test.FieldString(vm, "spec.template.spec.domain.devices.disks[2].name"))
+			s.Equal("scsi", test.FieldString(vm, "spec.template.spec.domain.devices.disks[2].disk.bus"))
+		})
+	})
+
+	s.Run("vm_hotplug_pvc with lun disk type", func() {
+		toolResult, err := s.CallTool("vm_hotplug_pvc", map[string]interface{}{
+			"namespace": "default",
+			"name":      "test-vm-hotplug",
+			"diskName":  "hp-lun",
+			"claimName": "my-lun-pvc",
+			"diskType":  "lun",
+		})
+		s.Run("no error", func() {
+			s.Nilf(err, "call tool failed %v", err)
+			s.Falsef(toolResult.IsError, "call tool failed: %v", toolResult.Content)
+		})
+		var decodedResult []unstructured.Unstructured
+		err = yaml.Unmarshal([]byte(toolResult.Content[0].(*mcp.TextContent).Text), &decodedResult)
+		s.Run("returns yaml with lun disk using scsi bus", func() {
+			s.Nilf(err, "invalid tool result content %v", err)
+			s.Require().Lenf(decodedResult, 1, "invalid resource count")
+			vm := &decodedResult[0]
+			s.Equal("hp-lun", test.FieldString(vm, "spec.template.spec.domain.devices.disks[3].name"))
+			s.Equal("scsi", test.FieldString(vm, "spec.template.spec.domain.devices.disks[3].lun.bus"))
+		})
+	})
+
+	s.Run("vm_hotplug_pvc with invalid bus for disk type", func() {
+		toolResult, err := s.CallTool("vm_hotplug_pvc", map[string]interface{}{
+			"namespace": "default",
+			"name":      "test-vm-hotplug",
+			"diskName":  "hp-bad",
+			"claimName": "my-pvc",
+			"diskType":  "lun",
+			"bus":       "virtio",
+		})
+		s.Nilf(err, "call tool failed %v", err)
+		s.Truef(toolResult.IsError, "expected call tool to fail for invalid bus/diskType combination")
+		s.Truef(strings.Contains(toolResult.Content[0].(*mcp.TextContent).Text, "invalid bus"),
+			"Expected invalid bus error, got %v", toolResult.Content[0].(*mcp.TextContent).Text)
+	})
+
+	s.Run("vm_hotplug on non-existent VM", func() {
+		for _, tool := range []string{"vm_hotplug_pvc", "vm_hotplug_datavolume"} {
+			s.Run(tool, func() {
+				params := map[string]interface{}{
+					"namespace":      "default",
+					"name":           "non-existent-vm",
+					"diskName":       "d1",
+					"claimName":      "pvc1",
+					"dataVolumeName": "dv1",
+				}
+				toolResult, err := s.CallTool(tool, params)
+				s.Nilf(err, "call tool failed %v", err)
+				s.Truef(toolResult.IsError, "expected call tool to fail for non-existent VM")
+				s.Truef(strings.Contains(toolResult.Content[0].(*mcp.TextContent).Text, "failed to get VirtualMachine"),
+					"Expected error message, got %v", toolResult.Content[0].(*mcp.TextContent).Text)
+			})
+		}
+	})
+}
+
 func (s *KubevirtSuite) TestVMTroubleshootPrompt() {
 	s.Run("vm-troubleshoot prompt returns troubleshooting guide", func() {
 		result, err := s.GetPrompt("vm-troubleshoot", map[string]string{
