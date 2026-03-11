@@ -1,0 +1,123 @@
+kind: Task
+apiVersion: mcpchecker/v1alpha2
+metadata:
+  labels:
+    suite: kubevirt
+    requires: kubevirt
+  name: "hotplug-volume-datavolume"
+  difficulty: medium
+spec:
+  requires:
+    - extension: kubernetes
+      as: k8s
+  setup:
+    - k8s.delete:
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: vm-test
+        ignoreNotFound: true
+    - k8s.create:
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: vm-test
+    - k8s.create:
+        apiVersion: kubevirt.io/v1
+        kind: VirtualMachine
+        metadata:
+          name: hotplug-vm
+          namespace: vm-test
+        spec:
+          runStrategy: Always
+          template:
+            spec:
+              domain:
+                devices: {}
+                memory:
+                  guest: 512Mi
+                resources: {}
+              terminationGracePeriodSeconds: 180
+    - k8s.create:
+        apiVersion: cdi.kubevirt.io/v1beta1
+        kind: DataVolume
+        metadata:
+          name: hotplug-dv
+          namespace: vm-test
+        spec:
+          source:
+            blank: {}
+          storage:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 1Gi
+  verify:
+    - script:
+        inline: |-
+          #!/usr/bin/env bash
+          set -e
+          NS="vm-test"
+          VM_NAME="hotplug-vm"
+          DV_NAME="hotplug-dv"
+
+          # Wait for the VMI to be ready
+          kubectl wait --for=jsonpath='{.status.phase}'=Running virtualmachineinstance/"$VM_NAME" -n "$NS" --timeout=120s 2>/dev/null || true
+
+          VMI_JSON=$(kubectl get virtualmachineinstance "$VM_NAME" -n "$NS" -o json)
+
+          # Find the volume that references the DataVolume
+          VOLUME_NAME=$(echo "$VMI_JSON" | jq -r ".spec.volumes[] | select(.dataVolume.name == \"$DV_NAME\") | .name")
+          if [[ -z "$VOLUME_NAME" ]]; then
+            echo "ERROR: VMI does not have a volume referencing DataVolume '$DV_NAME'"
+            echo "$VMI_JSON" | jq '.spec.volumes' 2>/dev/null || true
+            exit 1
+          fi
+          echo "VMI has volume '$VOLUME_NAME' referencing DataVolume '$DV_NAME'"
+
+          # Verify the volume has hotpluggable: true
+          HOTPLUGGABLE=$(echo "$VMI_JSON" | jq -r ".spec.volumes[] | select(.name == \"$VOLUME_NAME\") | .dataVolume.hotpluggable")
+          if [[ "$HOTPLUGGABLE" != "true" ]]; then
+            echo "ERROR: Volume '$VOLUME_NAME' does not have hotpluggable: true"
+            echo "$VMI_JSON" | jq ".spec.volumes[] | select(.name == \"$VOLUME_NAME\")" 2>/dev/null || true
+            exit 1
+          fi
+          echo "Volume '$VOLUME_NAME' has hotpluggable: true"
+
+          # Verify a disk with the same name exists
+          DISK_EXISTS=$(echo "$VMI_JSON" | jq -r ".spec.domain.devices.disks[] | select(.name == \"$VOLUME_NAME\") | .name")
+          if [[ -z "$DISK_EXISTS" ]]; then
+            echo "ERROR: VMI does not have a disk entry matching volume '$VOLUME_NAME'"
+            echo "$VMI_JSON" | jq '.spec.domain.devices.disks' 2>/dev/null || true
+            exit 1
+          fi
+          echo "VMI has disk entry matching volume '$VOLUME_NAME'"
+
+          echo "All hotplug DataVolume validations passed"
+          exit 0
+  cleanup:
+    - k8s.delete:
+        apiVersion: kubevirt.io/v1
+        kind: VirtualMachine
+        metadata:
+          name: hotplug-vm
+          namespace: vm-test
+        ignoreNotFound: true
+    - k8s.delete:
+        apiVersion: cdi.kubevirt.io/v1beta1
+        kind: DataVolume
+        metadata:
+          name: hotplug-dv
+          namespace: vm-test
+        ignoreNotFound: true
+    - k8s.delete:
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: vm-test
+        ignoreNotFound: true
+  prompt:
+    inline: |
+      A VirtualMachine named hotplug-vm is running in the vm-test namespace. A DataVolume named hotplug-dv also exists in the same namespace.
+      Please hotplug the DataVolume hotplug-dv as a disk into the running VirtualMachine hotplug-vm.
